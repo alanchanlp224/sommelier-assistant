@@ -24,6 +24,22 @@ npm run build
 3. Click "Load unpacked"
 4. Select the `dist` folder
 
+## Package for distribution
+
+To create a shareable zip for others to install:
+
+```bash
+npm run package
+```
+
+This produces `sommelier-assistant.zip` in the project root. Recipients can:
+
+1. Unzip the file
+2. Open `chrome://extensions`
+3. Enable "Developer mode"
+4. Click "Load unpacked"
+5. Select the unzipped folder
+
 ## Usage
 
 1. Add your wine shop domain in the extension popup (click the puzzle icon → Sommelier Assistant)
@@ -32,9 +48,10 @@ npm run build
 4. Click the floating wine glass icon in the bottom-right
 5. Vivino ratings appear next to each wine as they load
 
-## Default preset
+## Default presets
 
-- **wine.com**: `.product-tile, .product-item, [data-product]` / `.product-name, .product-title, .title, h2 a, h3 a`
+- **wineview.com.hk**: `li.product, li.has-post-title` / `.woocommerce-loop-product__title, h2, h3, a`
+- **tencellars.hk**: `.product-item, .product, article, [data-product]` / `h1` (winery: `h2`)
 
 ## Tech stack
 

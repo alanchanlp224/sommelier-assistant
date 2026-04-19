@@ -1,0 +1,14 @@
+Sommelier Assistant — Chrome "Load unpacked"
+
+Use THIS folder (the dist output) as the unpacked extension root. Chrome needs
+manifest.json, background.js, and content.js in the same folder you select.
+
+If you received the project SOURCE (no dist folder):
+  1. Install Node.js LTS from https://nodejs.org/
+  2. In a terminal: cd to the project folder, then run: npm install
+  3. Run: npm run build
+  4. In chrome://extensions choose "Load unpacked" and select the dist folder
+     (not the project root).
+
+To create a shareable zip on any OS: npm run package
+(That zips this built folder; do not rely on macOS-only "zip" commands.)

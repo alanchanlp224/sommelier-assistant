@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { resolve } from 'path';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const projectRoot = fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig({
   base: './',
@@ -10,9 +13,9 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       input: {
-        popup: resolve(__dirname, 'popup.html'),
-        content: resolve(__dirname, 'src/content/content.ts'),
-        background: resolve(__dirname, 'src/background/background.ts'),
+        popup: resolve(projectRoot, 'popup.html'),
+        content: resolve(projectRoot, 'src/content/content.ts'),
+        background: resolve(projectRoot, 'src/background/background.ts'),
       },
       output: {
         entryFileNames: (chunkInfo) => {
@@ -30,7 +33,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@': resolve(__dirname, 'src'),
+      '@': resolve(projectRoot, 'src'),
     },
   },
 });

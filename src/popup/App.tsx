@@ -1,30 +1,29 @@
 import { useEffect, useState } from 'react';
 import type { DomainConfig, DetectionResultMessage, LogEntry } from '../types';
 import { LOG_ENABLED_KEY } from '../shared/logger';
+import { DEFAULT_DOMAIN_PRESETS } from '../shared/defaultWhitelist';
+import {
+  DEFAULT_GITHUB_RELEASE_REPO,
+  compareSemver,
+  fetchLatestRelease,
+} from '../shared/githubUpdate';
 
 const DELAY_MIN_KEY = 'sommelier_delay_min_ms';
 const DELAY_MAX_KEY = 'sommelier_delay_max_ms';
 const DEFAULT_MIN_DELAY = 1500;
 const DEFAULT_MAX_DELAY = 3000;
 
-const DEFAULT_PRESETS: DomainConfig[] = [
-  {
-    domain: 'wine.com',
-    containerSelector: '.product-tile, .product-item, [data-product]',
-    nameSelector: '.product-name, .product-title, .title, h2 a, h3 a',
-  },
-  {
-    domain: 'wineview.com.hk',
-    containerSelector: 'li.product, li.has-post-title',
-    nameSelector: '.woocommerce-loop-product__title, h2, h3, a',
-  },
-  {
-    domain: 'tencellars.hk',
-    containerSelector: '.product-item, .product, article, [data-product]',
-    nameSelector: 'h1',
-    winerySelector: 'h2',
-  },
-];
+const DEFAULT_PRESETS = DEFAULT_DOMAIN_PRESETS;
+
+const PENDING_GITHUB_UPDATE_KEY = 'sommelier_pending_github_update';
+
+type PendingGithubUpdate = {
+  remoteVersion: string;
+  zipBrowserDownloadUrl: string | null;
+  releaseHtmlUrl: string;
+  releaseTitle: string;
+  checkedAt: string;
+};
 
 function App() {
   const [whitelist, setWhitelist] = useState<DomainConfig[]>([]);
@@ -46,6 +45,36 @@ function App() {
   } | null>(null);
   const [delayMin, setDelayMin] = useState(DEFAULT_MIN_DELAY);
   const [delayMax, setDelayMax] = useState(DEFAULT_MAX_DELAY);
+  const [manifestVersion] = useState(() => chrome.runtime.getManifest().version);
+  const [pendingGithubUpdate, setPendingGithubUpdate] = useState<PendingGithubUpdate | null>(null);
+  const [githubCheckError, setGithubCheckError] = useState<string | null>(null);
+  const [githubChecking, setGithubChecking] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    chrome.action.setBadgeText({ text: '' });
+  }, []);
+
+  useEffect(() => {
+    const loadPending = () => {
+      chrome.storage.local.get(PENDING_GITHUB_UPDATE_KEY, (data) => {
+        const v = data[PENDING_GITHUB_UPDATE_KEY] as PendingGithubUpdate | null | undefined;
+        setPendingGithubUpdate(v ?? null);
+      });
+    };
+    loadPending();
+    const onChange = (
+      changes: { [key: string]: chrome.storage.StorageChange },
+      area: string
+    ) => {
+      if (area === 'local' && changes[PENDING_GITHUB_UPDATE_KEY]) {
+        const next = changes[PENDING_GITHUB_UPDATE_KEY].newValue as PendingGithubUpdate | null | undefined;
+        setPendingGithubUpdate(next === undefined ? null : next);
+      }
+    };
+    chrome.storage.onChanged.addListener(onChange);
+    return () => chrome.storage.onChanged.removeListener(onChange);
+  }, []);
 
   useEffect(() => {
     chrome.storage.sync.get('whitelist', (data) => {
@@ -240,6 +269,56 @@ function App() {
     });
   };
 
+  const checkGithubRelease = async () => {
+    setGithubCheckError(null);
+    setDownloadError(null);
+    setGithubChecking(true);
+    try {
+      const info = await fetchLatestRelease(DEFAULT_GITHUB_RELEASE_REPO);
+      const hasUpdate = compareSemver(info.version, manifestVersion) > 0;
+      if (hasUpdate) {
+        const payload: PendingGithubUpdate = {
+          remoteVersion: info.version,
+          zipBrowserDownloadUrl: info.zipBrowserDownloadUrl,
+          releaseHtmlUrl: info.releaseHtmlUrl,
+          releaseTitle: info.releaseTitle,
+          checkedAt: new Date().toISOString(),
+        };
+        chrome.storage.local.set({ [PENDING_GITHUB_UPDATE_KEY]: payload }, () => {
+          setPendingGithubUpdate(payload);
+        });
+      } else {
+        chrome.storage.local.set({ [PENDING_GITHUB_UPDATE_KEY]: null }, () => {
+          setPendingGithubUpdate(null);
+        });
+      }
+    } catch (e) {
+      setGithubCheckError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGithubChecking(false);
+    }
+  };
+
+  const downloadReleaseZip = () => {
+    setDownloadError(null);
+    const url = pendingGithubUpdate?.zipBrowserDownloadUrl;
+    if (!url) {
+      setDownloadError('No zip file is attached to this release. Open the release page and download manually.');
+      return;
+    }
+    const filename = `sommelier-assistant-${pendingGithubUpdate.remoteVersion}.zip`;
+    chrome.downloads.download({ url, filename }, () => {
+      if (chrome.runtime.lastError) {
+        setDownloadError(chrome.runtime.lastError.message ?? 'Download failed');
+      }
+    });
+  };
+
+  const openReleasePage = () => {
+    const url = pendingGithubUpdate?.releaseHtmlUrl;
+    if (url) chrome.tabs.create({ url });
+  };
+
   const updateDomain = (domain: string, field: keyof DomainConfig, value: string) => {
     const updated = whitelist.map((d) => {
       if (d.domain !== domain) return d;
@@ -261,6 +340,67 @@ function App() {
       </header>
 
       <main className="p-4 space-y-4">
+        <section className="bg-white rounded-lg border border-stone-200 p-3 shadow-sm">
+          <h2 className="text-sm font-medium text-stone-700 mb-1">Updates (GitHub)</h2>
+          <p className="text-xs text-stone-500 mb-2">
+            Installed version <span className="font-mono">{manifestVersion}</span>
+            <span className="text-stone-400"> · </span>
+            <span className="break-all">{DEFAULT_GITHUB_RELEASE_REPO}</span>
+          </p>
+          {pendingGithubUpdate && (
+            <div className="mb-2 p-2 rounded-md bg-amber-50 border border-amber-200 text-xs text-amber-950">
+              <p className="font-medium">Newer release available</p>
+              <p className="mt-0.5">
+                {pendingGithubUpdate.releaseTitle} — v{pendingGithubUpdate.remoteVersion}
+              </p>
+              <div className="flex flex-wrap gap-2 mt-2">
+                {pendingGithubUpdate.zipBrowserDownloadUrl && (
+                  <button
+                    type="button"
+                    onClick={downloadReleaseZip}
+                    className="px-2 py-1 rounded bg-wine-600 text-white text-xs font-medium hover:bg-wine-700"
+                  >
+                    Download zip
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={openReleasePage}
+                  className="px-2 py-1 rounded bg-stone-200 text-stone-800 text-xs font-medium hover:bg-stone-300"
+                >
+                  Open release page
+                </button>
+              </div>
+              <p className="mt-2 text-stone-600">
+                Unpacked extensions cannot auto-install: unzip the download, replace your extension
+                folder (or load the new <span className="font-mono">dist</span>), then click Reload on{' '}
+                <span className="font-mono">chrome://extensions</span>.
+              </p>
+            </div>
+          )}
+          {githubCheckError && <p className="text-xs text-red-600 mb-2">{githubCheckError}</p>}
+          {downloadError && <p className="text-xs text-red-600 mb-2">{downloadError}</p>}
+          <button
+            type="button"
+            onClick={() => void checkGithubRelease()}
+            disabled={githubChecking}
+            className="w-full py-2 rounded-lg text-sm font-medium bg-stone-200 text-stone-800 hover:bg-stone-300 disabled:opacity-60"
+          >
+            {githubChecking ? 'Checking GitHub…' : 'Check for updates now'}
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              chrome.tabs.create({
+                url: `https://github.com/${DEFAULT_GITHUB_RELEASE_REPO}/releases`,
+              })
+            }
+            className="mt-2 w-full text-xs text-wine-800 hover:text-wine-950 underline"
+          >
+            View all releases on GitHub
+          </button>
+        </section>
+
         <section>
           <h2 className="text-sm font-medium text-stone-700 mb-2">
             Whitelisted Sites

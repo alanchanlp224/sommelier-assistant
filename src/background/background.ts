@@ -10,6 +10,12 @@ import type {
   VivinoSearchResult,
 } from '../types';
 import { logBackground, getLogs, isLoggingEnabled } from '../shared/logger';
+import { DEFAULT_DOMAIN_PRESETS } from '../shared/defaultWhitelist';
+import {
+  DEFAULT_GITHUB_RELEASE_REPO,
+  compareSemver,
+  fetchLatestRelease,
+} from '../shared/githubUpdate';
 
 const VIVINO_SEARCH_BASE = 'https://www.vivino.com/en/search/wines?q=';
 const DEFAULT_MIN_DELAY_MS = 1500;
@@ -17,6 +23,12 @@ const DEFAULT_MAX_DELAY_MS = 3000;
 
 const DELAY_MIN_KEY = 'sommelier_delay_min_ms';
 const DELAY_MAX_KEY = 'sommelier_delay_max_ms';
+
+const GITHUB_UPDATE_ALARM = 'sommelier-github-release-check';
+const PENDING_GITHUB_UPDATE_KEY = 'sommelier_pending_github_update';
+
+/** Period between automatic checks (GitHub unauthenticated limit is 60 req/hr per IP). */
+const GITHUB_CHECK_PERIOD_MINUTES = 360;
 
 /** Task queue: one search at a time with randomized delay */
 interface QueuedTask {
@@ -211,58 +223,128 @@ function unescapeHtml(str: string): string {
     .replace(/&#39;/g, "'");
 }
 
+/** Raw attribute value for data-preloaded-state (HTML-escaped JSON; inner quotes are &quot;). */
+function extractDataPreloadedStateRaw(html: string): string | null {
+  const lower = html.toLowerCase();
+  const needle = 'data-preloaded-state="';
+  const start = lower.indexOf(needle);
+  if (start === -1) return null;
+  const from = start + needle.length;
+  const end = html.indexOf('"', from);
+  if (end === -1) return null;
+  return html.slice(from, end);
+}
+
+function isVintageMatchRecord(x: unknown): boolean {
+  return !!x && typeof x === 'object' && 'vintage' in (x as object);
+}
+
+/** Recursively find Vivino search `matches` array (snake or camel parent). */
+function findSearchMatchesArray(root: unknown, depth = 0): Array<Record<string, unknown>> | null {
+  if (depth > 30 || root === null || typeof root !== 'object') return null;
+  if (Array.isArray(root)) {
+    if (root.length > 0 && isVintageMatchRecord(root[0])) {
+      return root as Array<Record<string, unknown>>;
+    }
+    return null;
+  }
+  const o = root as Record<string, unknown>;
+  const sr = (o.search_results ?? o.searchResults) as Record<string, unknown> | undefined;
+  if (sr && typeof sr === 'object' && !Array.isArray(sr)) {
+    const m = sr.matches;
+    if (Array.isArray(m) && m.length > 0 && isVintageMatchRecord(m[0])) {
+      return m as Array<Record<string, unknown>>;
+    }
+  }
+  for (const v of Object.values(o)) {
+    const found = findSearchMatchesArray(v, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Pick best wine from Vivino search `matches` for the given search term. */
+function pickBestFromMatches(
+  matches: Array<Record<string, unknown>>,
+  _searchTerm: string
+): VivinoSearchResult | null {
+  const searchWords = _searchTerm.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
+  let bestRated: VivinoSearchResult | null = null;
+  let bestRatedScore = -1;
+  let bestByName: VivinoSearchResult | null = null;
+  let bestByNameScore = -1;
+  for (const match of matches) {
+    const vintage = match?.vintage as Record<string, unknown> | undefined;
+    if (!vintage) continue;
+    const stats = (vintage.statistics ?? {}) as Record<string, unknown>;
+    const rating = (stats.ratings_average ?? 0) as number;
+    const count = (stats.ratings_count ?? 0) as number;
+    const wine = (vintage.wine ?? {}) as Record<string, unknown>;
+    const slug = (vintage.seo_name ?? wine.seo_name ?? '') as string;
+    const id = (wine.id ?? vintage.id ?? '') as string;
+    const vivinoUrl =
+      slug && id
+        ? `https://www.vivino.com/${slug}/w/${id}`
+        : `https://www.vivino.com/en/search/wines?q=${encodeURIComponent(_searchTerm)}`;
+    const name = (vintage.name ?? wine.name ?? '') as string;
+    const nameLower = name.toLowerCase();
+    const matchCount = searchWords.filter((w) => nameLower.includes(w)).length;
+    const score = searchWords.length > 0 ? matchCount / searchWords.length : 1;
+    const result = { rating, reviewCount: count, vivinoUrl, vivinoWineName: name || undefined };
+    if (rating > 0 && score > bestRatedScore) {
+      bestRatedScore = score;
+      bestRated = result;
+      if (score >= 0.5) return bestRated;
+    }
+    if (score > bestByNameScore) {
+      bestByNameScore = score;
+      bestByName = result;
+    }
+  }
+  if (bestRated) return bestRated;
+  if (bestByName && bestByNameScore >= 0.5) return bestByName;
+  return null;
+}
+
 /**
  * Parse Vivino search page HTML for first wine result.
- * Tries: data-preloaded-state (search_results.matches), __PRELOADED_STATE__, __NEXT_DATA__, regex.
+ * Tries: data-preloaded-state, application/json scripts, __PRELOADED_STATE__, __NEXT_DATA__, regex.
  */
 function parseVivinoSearchHtml(html: string, _searchTerm: string): VivinoSearchResult | null {
-  // 0. Try data-preloaded-state (Vivino search page embeds JSON here with HTML entities)
-  const dataPreloadedMatch = html.match(/data-preloaded-state="([^"]+)"/);
-  if (dataPreloadedMatch) {
+  // 0a. data-preloaded-state (escaped JSON; avoid fragile [^"]+ if a raw quote slips in)
+  const rawPreloaded = extractDataPreloadedStateRaw(html);
+  if (rawPreloaded) {
     try {
-      const jsonStr = unescapeHtml(dataPreloadedMatch[1]);
+      const jsonStr = unescapeHtml(rawPreloaded);
       const data = JSON.parse(jsonStr) as Record<string, unknown>;
-      const searchResults = data?.search_results as Record<string, unknown> | undefined;
+      const searchResults = (data?.search_results ?? data?.searchResults) as
+        | Record<string, unknown>
+        | undefined;
       const matches = searchResults?.matches as Array<Record<string, unknown>> | undefined;
       if (Array.isArray(matches) && matches.length > 0) {
-        const searchWords = _searchTerm.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
-        let bestRated: VivinoSearchResult | null = null;
-        let bestRatedScore = -1;
-        let bestByName: VivinoSearchResult | null = null;
-        let bestByNameScore = -1;
-        for (const match of matches) {
-          const vintage = match?.vintage as Record<string, unknown> | undefined;
-          if (!vintage) continue;
-          const stats = (vintage.statistics ?? {}) as Record<string, unknown>;
-          const rating = (stats.ratings_average ?? 0) as number;
-          const count = (stats.ratings_count ?? 0) as number;
-          const wine = (vintage.wine ?? {}) as Record<string, unknown>;
-          const slug = (vintage.seo_name ?? wine.seo_name ?? '') as string;
-          const id = (wine.id ?? vintage.id ?? '') as string;
-          const vivinoUrl =
-            slug && id
-              ? `https://www.vivino.com/${slug}/w/${id}`
-              : `https://www.vivino.com/en/search/wines?q=${encodeURIComponent(_searchTerm)}`;
-          const name = (vintage.name ?? wine.name ?? '') as string;
-          const nameLower = name.toLowerCase();
-          const matchCount = searchWords.filter((w) => nameLower.includes(w)).length;
-          const score = searchWords.length > 0 ? matchCount / searchWords.length : 1;
-          const result = { rating, reviewCount: count, vivinoUrl, vivinoWineName: name || undefined };
-          if (rating > 0 && score > bestRatedScore) {
-            bestRatedScore = score;
-            bestRated = result;
-            if (score >= 0.5) return bestRated;
-          }
-          if (score > bestByNameScore) {
-            bestByNameScore = score;
-            bestByName = result;
-          }
-        }
-        if (bestRated) return bestRated;
-        if (bestByName && bestByNameScore >= 0.5) return bestByName;
+        const picked = pickBestFromMatches(matches, _searchTerm);
+        if (picked) return picked;
       }
     } catch {
       /* fall through */
+    }
+  }
+
+  // 0b. Large application/json blocks (e.g. locale-specific / explore pages without data-preloaded-state)
+  const jsonScriptRe = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let scriptMatch: RegExpExecArray | null;
+  while ((scriptMatch = jsonScriptRe.exec(html)) !== null) {
+    const body = scriptMatch[1].trim();
+    if (body.length < 500 || !body.includes('"matches"')) continue;
+    try {
+      const data = JSON.parse(body) as unknown;
+      const matches = findSearchMatchesArray(data);
+      if (matches && matches.length > 0) {
+        const picked = pickBestFromMatches(matches, _searchTerm);
+        if (picked) return picked;
+      }
+    } catch {
+      /* next script */
     }
   }
 
@@ -401,32 +483,78 @@ async function runValidationTest(): Promise<{
 
 /** Get default config with presets */
 function getDefaultConfig(): ExtensionConfig {
-  return {
-    whitelist: [
-      {
-        domain: 'wine.com',
-        containerSelector: '.product-tile, .product-item, [data-product]',
-        nameSelector: '.product-name, .product-title, .title, h2 a, h3 a',
-      },
-      {
-        domain: 'wineview.com.hk',
-        containerSelector: 'li.product, li.has-post-title',
-        nameSelector: '.woocommerce-loop-product__title, h2, h3, a',
-      },
-      {
-        domain: 'tencellars.hk',
-        containerSelector: '.product-item, .product, article, [data-product]',
-        nameSelector: 'h1',
-        winerySelector: 'h2',
-      },
-    ],
-  };
+  return { whitelist: [...DEFAULT_DOMAIN_PRESETS] };
 }
 
-chrome.runtime.onInstalled.addListener(async () => {
+function scheduleGithubReleaseAlarm(): void {
+  chrome.alarms.get(GITHUB_UPDATE_ALARM, (existing) => {
+    if (!existing) {
+      chrome.alarms.create(GITHUB_UPDATE_ALARM, { periodInMinutes: GITHUB_CHECK_PERIOD_MINUTES });
+    }
+  });
+}
+
+/** Compare manifest version to latest GitHub release; badge + local hint when newer build exists. */
+async function runGithubReleaseCheckAndBadge(): Promise<void> {
+  const local = chrome.runtime.getManifest().version;
+  try {
+    const info = await fetchLatestRelease(DEFAULT_GITHUB_RELEASE_REPO);
+    const hasUpdate = compareSemver(info.version, local) > 0;
+    if (hasUpdate) {
+      await chrome.storage.local.set({
+        [PENDING_GITHUB_UPDATE_KEY]: {
+          remoteVersion: info.version,
+          zipBrowserDownloadUrl: info.zipBrowserDownloadUrl,
+          releaseHtmlUrl: info.releaseHtmlUrl,
+          releaseTitle: info.releaseTitle,
+          checkedAt: new Date().toISOString(),
+        },
+      });
+      chrome.action.setBadgeText({ text: '!' });
+      chrome.action.setBadgeBackgroundColor({ color: '#b91c1c' });
+    } else {
+      await chrome.storage.local.set({ [PENDING_GITHUB_UPDATE_KEY]: null });
+      chrome.action.setBadgeText({ text: '' });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await logBackground('warn', 'GitHub release check failed', { error: msg });
+  }
+}
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+  const defaults = getDefaultConfig().whitelist;
   const { whitelist } = await chrome.storage.sync.get('whitelist');
-  if (!whitelist) {
-    await chrome.storage.sync.set({ whitelist: getDefaultConfig().whitelist });
+  const existing = Array.isArray(whitelist) ? whitelist : [];
+
+  if (details.reason === 'install') {
+    if (existing.length === 0) {
+      await chrome.storage.sync.set({ whitelist: defaults });
+    }
+  } else if (details.reason === 'update') {
+    const domains = new Set(existing.map((d) => d.domain));
+    const merged = [...existing];
+    for (const d of defaults) {
+      if (!domains.has(d.domain)) {
+        merged.push(d);
+        domains.add(d.domain);
+      }
+    }
+    await chrome.storage.sync.set({ whitelist: merged });
+  }
+
+  scheduleGithubReleaseAlarm();
+  await runGithubReleaseCheckAndBadge();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  scheduleGithubReleaseAlarm();
+  void runGithubReleaseCheckAndBadge();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === GITHUB_UPDATE_ALARM) {
+    void runGithubReleaseCheckAndBadge();
   }
 });
 

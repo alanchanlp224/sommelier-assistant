@@ -16,6 +16,7 @@ import {
   compareSemver,
   fetchLatestRelease,
 } from '../shared/githubUpdate';
+import { normalizeWineSearchQuery } from '../shared/normalizeWineSearchQuery';
 
 const VIVINO_SEARCH_BASE = 'https://www.vivino.com/en/search/wines?q=';
 const DEFAULT_MIN_DELAY_MS = 1500;
@@ -155,7 +156,7 @@ function queueSearch(wineName: string, tabId: number): Promise<VivinoSearchResul
 }
 
 async function searchVivino(wineName: string): Promise<VivinoSearchResult | null> {
-  const cleanName = wineName.replace(/["']/g, '').trim();
+  const cleanName = normalizeWineSearchQuery(wineName);
   const htmlUrl = `${VIVINO_SEARCH_BASE}${encodeURIComponent(cleanName)}`;
   await logBackground('info', `Searching Vivino for`, { wineName: cleanName });
 

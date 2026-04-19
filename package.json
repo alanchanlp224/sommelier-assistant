@@ -1,6 +1,6 @@
 {
   "name": "sommelier-assistant",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "Chrome extension that adds Vivino ratings to wine products on e-commerce sites",
   "repository": {
     "type": "git",

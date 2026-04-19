@@ -132,6 +132,12 @@ function clearHighlights(): void {
   });
 }
 
+/** Clicks on the overlay UI must not be handled as page “product” clicks (capture runs first). */
+function isSommelierOverlayClick(target: EventTarget | null): boolean {
+  const el = target instanceof Element ? target : (target as Node | null)?.parentElement;
+  return !!el?.closest('#sommelier-detection-overlay');
+}
+
 export function startDetection(): void {
   const cancel = () => {
     overlay.remove();
@@ -146,6 +152,7 @@ export function startDetection(): void {
   let containerSelector = '';
 
   const step1Handler = (e: MouseEvent) => {
+    if (isSommelierOverlayClick(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
     const target = e.target as HTMLElement;
@@ -175,6 +182,7 @@ export function startDetection(): void {
     document.body.appendChild(overlay2);
 
     const step2Handler = (e2: MouseEvent) => {
+      if (isSommelierOverlayClick(e2.target)) return;
       const nameTarget = (e2.target as Node).nodeType === Node.ELEMENT_NODE
         ? (e2.target as HTMLElement)
         : (e2.target as Node).parentElement;
@@ -216,6 +224,7 @@ export function startDetection(): void {
       document.body.appendChild(overlay3);
 
       const step3Handler = (e3: MouseEvent) => {
+        if (isSommelierOverlayClick(e3.target)) return;
         const wineryTarget = (e3.target as Node).nodeType === Node.ELEMENT_NODE
           ? (e3.target as HTMLElement)
           : (e3.target as Node).parentElement;

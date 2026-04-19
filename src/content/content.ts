@@ -31,11 +31,111 @@ const SKIP_NAMES = new Set([
   'free shipping',
 ]);
 
+/** Footer / header / utility phrases (lowercase) — not product titles */
+const NAV_FOOTER_PHRASES = new Set([
+  ...SKIP_NAMES,
+  'about us',
+  'privacy policy',
+  'terms of use',
+  'terms & conditions',
+  'terms and conditions',
+  'delivery & pick-up',
+  'delivery and pick-up',
+  'delivery',
+  'pick-up',
+  'pick up',
+  'contact us',
+  'contact',
+  'login',
+  'sign in',
+  'sign up',
+  'register',
+  'my account',
+  'account',
+  'shopping cart',
+  'cart',
+  'checkout',
+  'wishlist',
+  'store locator',
+  'careers',
+  'site map',
+  'newsletter',
+  'subscribe',
+  'follow us',
+  'facebook',
+  'instagram',
+  'youtube',
+  'whatsapp',
+  'wechat',
+  'home',
+  'shop',
+  'all wines',
+  'wine list',
+  'promotions',
+  'help',
+  'faq',
+  'cookies',
+]);
+
+const NAV_HREF_SNIPPETS = [
+  '/about',
+  '/privacy',
+  '/policy',
+  '/contact',
+  '/terms',
+  '/login',
+  '/signin',
+  '/signup',
+  '/account',
+  '/cart',
+  '/checkout',
+  '/help',
+  '/cookie',
+  'mailto:',
+  'tel:',
+  '/customer/',
+  '/stores',
+];
+
 function isLikelyWineName(name: string): boolean {
   const normalized = name.toLowerCase().trim();
   if (SKIP_NAMES.has(normalized)) return false;
   if (normalized.length < 3) return false;
   return true;
+}
+
+/** Reject nav/footer links and titles that are too short or generic to be a wine listing. */
+function isLikelyWineDisplayName(name: string, el: HTMLElement | null): boolean {
+  if (!isLikelyWineName(name)) return false;
+  const normalized = name.toLowerCase().trim().replace(/\s+/g, ' ');
+  if (NAV_FOOTER_PHRASES.has(normalized)) return false;
+  if (el?.tagName === 'A') {
+    const href = ((el as HTMLAnchorElement).href || '').toLowerCase();
+    if (href.startsWith('javascript:') || href === '' || href.endsWith('#')) return false;
+    for (const snip of NAV_HREF_SNIPPETS) {
+      if (href.includes(snip)) return false;
+    }
+  }
+  const hasVintageYear = /\b(19|20)\d{2}\b/.test(name);
+  const words = name.split(/\s+/).filter((w) => w.length > 0);
+  const wordCount = words.length;
+  if (hasVintageYear && wordCount >= 2) return true;
+  if (name.length >= 22) return true;
+  if (wordCount >= 4) return true;
+  if (name.length >= 14 && wordCount >= 3) return true;
+  if (wordCount <= 2 && !hasVintageYear && name.length < 20) return false;
+  return wordCount >= 3 || hasVintageYear;
+}
+
+/** Prefer product detail links on listing pages (e.g. Watson’s Wine uses …/p/…). */
+function preferProductAnchors(candidates: Iterable<Element>): HTMLElement[] {
+  const list = [...candidates] as HTMLElement[];
+  const productLinks = list.filter((el) => {
+    if (el.tagName !== 'A') return false;
+    const href = ((el as HTMLAnchorElement).href || '').toLowerCase();
+    return href.includes('/p/') || href.includes('/product/');
+  });
+  return productLinks.length > 0 ? productLinks : list;
 }
 
 /** WooCommerce fallback selectors when config returns no results */
@@ -63,11 +163,19 @@ function scanWines(config: DomainConfig): { name: string; element: HTMLElement }
       source,
     });
     containers.forEach((container) => {
-      const nameEl = container.querySelector(nameSel) as HTMLElement | null;
-      if (!nameEl) return;
-      const wineName = nameEl.textContent?.trim();
-      if (!wineName || wineName.length < 2) return;
-      if (!isLikelyWineName(wineName)) return;
+      const candidates = preferProductAnchors(container.querySelectorAll(nameSel));
+      let nameEl: HTMLElement | null = null;
+      let wineName: string | null = null;
+      for (const el of candidates) {
+        const he = el as HTMLElement;
+        const candidateName = he.textContent?.trim();
+        if (!candidateName || candidateName.length < 2) continue;
+        if (!isLikelyWineDisplayName(candidateName, he)) continue;
+        nameEl = he;
+        wineName = candidateName;
+        break;
+      }
+      if (!nameEl || !wineName) return;
 
       let searchName = wineName;
       let winery: string | null = null;
@@ -97,12 +205,13 @@ function scanWines(config: DomainConfig): { name: string; element: HTMLElement }
     const results: { name: string; element: HTMLElement }[] = [];
     const containers = document.querySelectorAll(containerSel);
     containers.forEach((container) => {
-      const candidates = container.querySelectorAll(nameSel);
+      const candidates = preferProductAnchors(container.querySelectorAll(nameSel));
       for (const el of candidates) {
-        const name = (el as HTMLElement).textContent?.trim();
+        const he = el as HTMLElement;
+        const name = he.textContent?.trim();
         if (!name || name.length < 2) continue;
-        if (!isLikelyWineName(name)) continue;
-        results.push({ name, element: el as HTMLElement });
+        if (!isLikelyWineDisplayName(name, he)) continue;
+        results.push({ name, element: he });
         break;
       }
     });

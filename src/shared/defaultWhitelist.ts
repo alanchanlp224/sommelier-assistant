@@ -16,4 +16,10 @@ export const DEFAULT_DOMAIN_PRESETS: DomainConfig[] = [
     nameSelector: 'h1',
     winerySelector: 'h2',
   },
+  {
+    domain: 'watsonswine.com',
+    containerSelector:
+      'div.items:has(a[href*="/p/"]), div[class*="product"]:has(a[href*="/p/"]), div.items',
+    nameSelector: 'a[href*="/p/"], a[href*="/product/"], h2, h3, a',
+  },
 ];

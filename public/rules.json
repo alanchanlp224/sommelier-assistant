@@ -1,0 +1,88 @@
+[
+  {
+    "id": 101,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "User-Agent",
+          "operation": "set",
+          "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        },
+        {
+          "header": "Content-Type",
+          "operation": "set",
+          "value": "application/json"
+        },
+        {
+          "header": "Origin",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Mobile",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Platform",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Full-Version-List",
+          "operation": "remove"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://www\\.vivino\\.com/api/.*",
+      "resourceTypes": ["xmlhttprequest"]
+    }
+  },
+  {
+    "id": 102,
+    "priority": 2,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        {
+          "header": "User-Agent",
+          "operation": "set",
+          "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        },
+        {
+          "header": "Content-Type",
+          "operation": "set",
+          "value": "application/json"
+        },
+        {
+          "header": "Origin",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Mobile",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Platform",
+          "operation": "remove"
+        },
+        {
+          "header": "Sec-CH-UA-Full-Version-List",
+          "operation": "remove"
+        }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https://www\\.vivino\\.com/api/.*",
+      "resourceTypes": ["other"]
+    }
+  }
+]

@@ -1,9 +1,11 @@
 /**
  * Sommelier Assistant - Background Service Worker
- * Handles: Task queue with rate limiting, Vivino fetch & parse
+ * Handles: Task queue with rate limiting, Vivino Explore API search
  */
 
 import type {
+  DetectionResultMessage,
+  DomainConfig,
   ExtensionConfig,
   ExtensionMessage,
   LogEntry,
@@ -18,7 +20,9 @@ import {
 } from '../shared/githubUpdate';
 import { normalizeWineSearchQuery } from '../shared/normalizeWineSearchQuery';
 
-const VIVINO_SEARCH_BASE = 'https://www.vivino.com/en/search/wines?q=';
+/** Explore list JSON — same source the SPA loads after shell HTML (see `public/rules.json` for MV3 headers). */
+const VIVINO_EXPLORE_API = 'https://www.vivino.com/api/explore/explore';
+
 const DEFAULT_MIN_DELAY_MS = 1500;
 const DEFAULT_MAX_DELAY_MS = 3000;
 
@@ -155,85 +159,246 @@ function queueSearch(wineName: string, tabId: number): Promise<VivinoSearchResul
   });
 }
 
+function buildVivinoExploreApiUrl(
+  searchTerm: string,
+  page: number,
+  orderBy: string,
+  order: 'asc' | 'desc',
+  paramStyle: 'country_code' | 'country_codes_array' = 'country_code'
+): string {
+  if (paramStyle === 'country_codes_array') {
+    const p = new URLSearchParams();
+    p.append('country_codes[]', 'us');
+    p.append('country_codes[]', 'fr');
+    p.append('currency_code', 'USD');
+    p.set('min_rating', '0');
+    p.set('order_by', orderBy);
+    p.set('order', order);
+    p.set('page', String(page));
+    p.set('per_page', '25');
+    p.set('price_range_min', '0');
+    p.set('price_range_max', '1000000');
+    p.set('search_term', searchTerm);
+    /** Vivino web client always appends `language` (see webpack `Vg` / explore helpers). */
+    p.set('language', 'en');
+    return `${VIVINO_EXPLORE_API}?${p.toString()}`;
+  }
+  const params = new URLSearchParams({
+    country_code: 'US',
+    currency_code: 'USD',
+    min_rating: '0',
+    order_by: orderBy,
+    order,
+    page: String(page),
+    per_page: '25',
+    price_range_min: '0',
+    price_range_max: '1000000',
+    search_term: searchTerm,
+    language: 'en',
+  });
+  return `${VIVINO_EXPLORE_API}?${params.toString()}`;
+}
+
+function parseVivinoJsonFromText(text: string): unknown | null {
+  const t = text.trim();
+  if (!t.startsWith('{') && !t.startsWith('[')) return null;
+  try {
+    return JSON.parse(t) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function parseVivinoExploreApiResponse(data: unknown, searchTerm: string): VivinoSearchResult | null {
+  const matches = findSearchMatchesArray(data);
+  if (!matches || matches.length === 0) return null;
+  return pickBestFromMatches(matches, searchTerm);
+}
+
+function vivinoExploreRecordsMatched(data: unknown): number | null {
+  if (!data || typeof data !== 'object') return null;
+  const ev = (data as Record<string, unknown>).explore_vintage;
+  if (!ev || typeof ev !== 'object' || Array.isArray(ev)) return null;
+  const n = (ev as Record<string, unknown>).records_matched;
+  return typeof n === 'number' ? n : null;
+}
+
+/** For failed searches: log Vivino payload shape (and optional raw snippet) without huge strings. */
+function summarizeExplorePayload(data: unknown, maxPreview = 16): Record<string, unknown> {
+  const rm = vivinoExploreRecordsMatched(data);
+  const out: Record<string, unknown> = { records_matched: rm };
+  const matches = findSearchMatchesArray(data);
+  if (!matches?.length) {
+    out.matches_in_payload = 0;
+    return out;
+  }
+  out.matches_in_payload = matches.length;
+  out.match_previews = matches.slice(0, maxPreview).map((m) => {
+    const vintage = m?.vintage as Record<string, unknown> | undefined;
+    const wine = (vintage?.wine ?? {}) as Record<string, unknown>;
+    const stats = (vintage?.statistics ?? {}) as Record<string, unknown>;
+    const name = String(vintage?.name ?? wine?.name ?? '');
+    const slug = String(vintage?.seo_name ?? wine?.seo_name ?? '');
+    return {
+      name: name.slice(0, 130),
+      slug: slug.slice(0, 90),
+      ratings_average: stats.ratings_average ?? 0,
+      ratings_count: stats.ratings_count ?? 0,
+    };
+  });
+  return out;
+}
+
+interface VivinoApiSearchTrace {
+  lastPayload: unknown | null;
+  /** Truncated raw JSON from last successful Vivino HTTP body (for debugging misses). */
+  lastRawSnippet: string | null;
+}
+
+async function searchVivinoExploreWithParamStyle(
+  cleanName: string,
+  paramStyle: 'country_code' | 'country_codes_array',
+  trace?: VivinoApiSearchTrace
+): Promise<VivinoSearchResult | null> {
+  const sortPlans: Array<{ orderBy: string; order: 'asc' | 'desc'; maxPage: number }> = [
+    { orderBy: 'price', order: 'desc', maxPage: 4 },
+    { orderBy: 'price', order: 'asc', maxPage: 4 },
+    { orderBy: 'ratings_average', order: 'desc', maxPage: 2 },
+  ];
+
+  for (const { orderBy, order, maxPage } of sortPlans) {
+    for (let page = 1; page <= maxPage; page++) {
+      const url = buildVivinoExploreApiUrl(cleanName, page, orderBy, order, paramStyle);
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            /** Mirrors Vivino's web `fetch` wrapper (`X-Requested-With`, JSON accept/type). */
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Referer: 'https://www.vivino.com/en/explore',
+          },
+          redirect: 'follow',
+        });
+      } catch (err) {
+        await logBackground('warn', `Vivino API fetch failed`, {
+          error: err instanceof Error ? err.message : String(err),
+          url,
+        });
+        continue;
+      }
+
+      if (res.status === 429) {
+        throw new Error('Too many requests. Please wait a moment and try again.');
+      }
+      if (!res.ok) {
+        let bodyPeek = '';
+        try {
+          bodyPeek = (await res.clone().text()).slice(0, 220);
+        } catch {
+          /* ignore */
+        }
+        await logBackground('debug', `Vivino API response`, {
+          status: res.status,
+          page,
+          orderBy,
+          order,
+          paramStyle,
+          bodyPeek,
+        });
+        continue;
+      }
+
+      const textBody = await res.text();
+      if (trace) {
+        trace.lastRawSnippet = textBody.slice(0, 4000);
+      }
+      const data = parseVivinoJsonFromText(textBody);
+      if (data === null) {
+        await logBackground('debug', `Vivino API body not JSON`, {
+          page,
+          orderBy,
+          paramStyle,
+          bodySnippet: textBody.slice(0, 400),
+        });
+        continue;
+      }
+      if (trace) {
+        trace.lastPayload = data;
+      }
+
+      const rm = vivinoExploreRecordsMatched(data);
+      if (rm === 0 && page === 1) {
+        await logBackground('debug', `Vivino API zero records for query`, {
+          cleanName,
+          paramStyle,
+          vivinoPayloadSummary: summarizeExplorePayload(data),
+          rawResponseSnippet: textBody.slice(0, 2500),
+        });
+        return null;
+      }
+
+      const picked = parseVivinoExploreApiResponse(data, cleanName);
+      if (picked) {
+        await logBackground('info', `Vivino API matched wine`, {
+          page,
+          orderBy,
+          order,
+          paramStyle,
+          vivinoUrl: picked.vivinoUrl,
+        });
+        return picked;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function searchVivinoViaExploreApi(
+  cleanName: string,
+  trace?: VivinoApiSearchTrace
+): Promise<VivinoSearchResult | null> {
+  const primary = await searchVivinoExploreWithParamStyle(cleanName, 'country_code', trace);
+  if (primary) return primary;
+  return searchVivinoExploreWithParamStyle(cleanName, 'country_codes_array', trace);
+}
+
 async function searchVivino(wineName: string): Promise<VivinoSearchResult | null> {
   const cleanName = normalizeWineSearchQuery(wineName);
-  const htmlUrl = `${VIVINO_SEARCH_BASE}${encodeURIComponent(cleanName)}`;
   await logBackground('info', `Searching Vivino for`, { wineName: cleanName });
 
-  let response: Response;
-  try {
-    response = await fetch(htmlUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Referer: 'https://www.vivino.com/',
-      },
-      redirect: 'follow',
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await logBackground('error', `Vivino fetch failed`, { error: msg, url: htmlUrl });
-    throw err;
-  }
-
-  await logBackground('info', `Vivino HTML response`, {
-    status: response.status,
-    ok: response.ok,
-    url: response.url,
-  });
-
-  if (response.status === 404) return null;
-  if (response.status === 429) {
-    throw new Error('Too many requests. Please wait a moment and try again.');
-  }
-  if (!response.ok) {
-    await logBackground('error', `Vivino HTTP error`, { status: response.status });
-    throw new Error(`Vivino returned ${response.status}`);
-  }
-
-  const html = await response.text();
-  await logBackground('debug', `Vivino HTML received`, {
-    htmlLength: html.length,
-    hasPreloaded: html.includes('__PRELOADED_STATE__'),
-    hasNextData: html.includes('__NEXT_DATA__'),
-  });
-
-  const result = parseVivinoSearchHtml(html, cleanName);
-  if (!result) {
-    await logBackground('warn', `Vivino parse failed`, {
-      htmlLength: html.length,
-      htmlPreview: html.slice(0, 300),
+  const trace: VivinoApiSearchTrace = { lastPayload: null, lastRawSnippet: null };
+  const apiResult = await searchVivinoViaExploreApi(cleanName, trace);
+  if (!apiResult) {
+    const vivinoPayloadSummary = trace.lastPayload ? summarizeExplorePayload(trace.lastPayload) : null;
+    const matchedCount =
+      vivinoPayloadSummary && typeof vivinoPayloadSummary.matches_in_payload === 'number'
+        ? vivinoPayloadSummary.matches_in_payload
+        : 0;
+    let hint = 'No JSON body captured (HTTP error or non-JSON response).';
+    if (trace.lastPayload && vivinoPayloadSummary) {
+      const rm = vivinoPayloadSummary.records_matched;
+      if (matchedCount > 0) {
+        hint = 'Vivino returned matches but none passed anchor/year filters.';
+      } else if (typeof rm === 'number' && rm === 0) {
+        hint = 'Vivino records_matched was 0 for this query.';
+      } else {
+        hint = 'Payload parsed but no matches array extracted.';
+      }
+    }
+    await logBackground('warn', `No Vivino result after Explore API search`, {
+      cleanName,
+      vivinoPayloadSummary,
+      rawResponseSnippet: trace.lastRawSnippet ?? undefined,
+      hint,
     });
   }
-  return result;
-}
-
-/**
- * Unescape HTML entities in a string.
- */
-function unescapeHtml(str: string): string {
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#39;/g, "'");
-}
-
-/** Raw attribute value for data-preloaded-state (HTML-escaped JSON; inner quotes are &quot;). */
-function extractDataPreloadedStateRaw(html: string): string | null {
-  const lower = html.toLowerCase();
-  const needle = 'data-preloaded-state="';
-  const start = lower.indexOf(needle);
-  if (start === -1) return null;
-  const from = start + needle.length;
-  const end = html.indexOf('"', from);
-  if (end === -1) return null;
-  return html.slice(from, end);
+  return apiResult;
 }
 
 function isVintageMatchRecord(x: unknown): boolean {
@@ -257,6 +422,13 @@ function findSearchMatchesArray(root: unknown, depth = 0): Array<Record<string, 
       return m as Array<Record<string, unknown>>;
     }
   }
+  const ev = (o.explore_vintage ?? o.exploreVintage) as Record<string, unknown> | undefined;
+  if (ev && typeof ev === 'object' && !Array.isArray(ev)) {
+    const m = ev.matches;
+    if (Array.isArray(m) && m.length > 0 && isVintageMatchRecord(m[0])) {
+      return m as Array<Record<string, unknown>>;
+    }
+  }
   for (const v of Object.values(o)) {
     const found = findSearchMatchesArray(v, depth + 1);
     if (found) return found;
@@ -264,16 +436,181 @@ function findSearchMatchesArray(root: unknown, depth = 0): Array<Record<string, 
   return null;
 }
 
-/** Pick best wine from Vivino search `matches` for the given search term. */
+/** Normalize for matching accents (Château vs Chateau) and combining marks. */
+function foldWineCompare(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+/** Strip generic Bordeaux/wine tokens so we match the distinctive part of the query (e.g. Cantemerle, not just “Château”). */
+const WINE_QUERY_STOPWORDS = new Set([
+  'chateau',
+  'châteaux',
+  'château',
+  'domaine',
+  'wine',
+  'the',
+  'de',
+  'du',
+  'des',
+  'la',
+  'le',
+  'les',
+  'grand',
+  'cru',
+  'classé',
+  'rouge',
+  'blanc',
+  'red',
+  'white',
+  'vintage',
+]);
+
+/**
+ * Shop titles often append grape (e.g. “Pinot Noir”) but Vivino vintage names omit it —
+ * excluding these as required anchors avoids rejecting the correct hit (e.g. Les Violettes).
+ */
+const GRAPE_VARIETY_ANCHOR_SKIP = new Set([
+  'pinot',
+  'noir',
+  'gris',
+  'chardonnay',
+  'cabernet',
+  'sauvignon',
+  'merlot',
+  'syrah',
+  'shiraz',
+  'riesling',
+  'sangiovese',
+  'nebbiolo',
+  'gamay',
+  'malbec',
+  'tempranillo',
+  'grenache',
+  'mourvedre',
+  'viognier',
+  'semillon',
+  'albarino',
+  'dolcetto',
+  'barbera',
+  'zinfandel',
+  'chenin',
+  'muscat',
+  'torrontes',
+  'carmenere',
+  'primitivo',
+  'corvina',
+  'vermentino',
+  'gewurztraminer',
+  'trebbiano',
+  'pinotage',
+  'furmint',
+  'negroamaro',
+  'carignan',
+  'mencia',
+  'aglianico',
+  'grillo',
+  'verdejo',
+  'assyrtiko',
+  'rose',
+]);
+
+function anchorTokensForWineQuery(term: string): { anchors: string[]; year: string | null } {
+  const folded = foldWineCompare(term);
+  const yearMatch = folded.match(/\b(19|20)\d{2}\b/);
+  const year = yearMatch ? yearMatch[0] : null;
+  const words = folded.split(/\s+/).filter((w) => w.length > 1 && !/^(19|20)\d{2}$/.test(w));
+  let anchors = words.filter((w) => !WINE_QUERY_STOPWORDS.has(w));
+  anchors = anchors.filter((w) => !GRAPE_VARIETY_ANCHOR_SKIP.has(w));
+  if (anchors.length === 0) {
+    anchors = words.filter((w) => w.length > 3 && !GRAPE_VARIETY_ANCHOR_SKIP.has(w));
+  }
+  if (anchors.length === 0) {
+    anchors = words.filter((w) => !GRAPE_VARIETY_ANCHOR_SKIP.has(w));
+  }
+  if (anchors.length === 0) {
+    anchors = words;
+  }
+  return { anchors, year };
+}
+
+/** Importance weight for a query token — longer estate-specific words matter more than short glue words. */
+function tokenImportance(token: string): number {
+  if (token.length <= 2) return 0.35;
+  if (token.length === 3) return 0.75;
+  if (token.length <= 5) return 1.0;
+  return Math.min(2.0, 1.15 + token.length * 0.05);
+}
+
+/**
+ * Score how well `token` matches Vivino fields (vintage title, wine name, slug-as-text).
+ * Name match > winery-only > slug-only.
+ */
+function scoreTokenAgainstRecord(
+  token: string,
+  vintageNameFolded: string,
+  wineNameFolded: string,
+  slugFolded: string
+): number {
+  const w = tokenImportance(token);
+  const slugAsText = slugFolded.replace(/-/g, ' ');
+  if (vintageNameFolded.includes(token)) return w * 1.0;
+  if (wineNameFolded.includes(token)) return w * 0.92;
+  if (slugAsText.includes(token)) return w * 0.85;
+  return 0;
+}
+
+const MATCH_YEAR_BONUS = 10;
+const MATCH_RATING_WEIGHT = 0.18;
+const MATCH_REVIEW_LOG_WEIGHT = 0.06;
+
+/** Sum of weighted token hits + optional year bonus + weak Vivino popularity signals — highest wins. */
+function vivinoRecordMatchScoreFields(
+  tokens: string[],
+  yearFromQuery: string | null,
+  vintageNameFolded: string,
+  wineNameFolded: string,
+  slugFolded: string,
+  rating: number,
+  reviewCount: number
+): { total: number; tokenSum: number; yearMatch: boolean } {
+  let tokenSum = 0;
+  for (const t of tokens) {
+    tokenSum += scoreTokenAgainstRecord(t, vintageNameFolded, wineNameFolded, slugFolded);
+  }
+
+  const yearMatch = !!(
+    yearFromQuery &&
+    (vintageNameFolded.includes(yearFromQuery) ||
+      wineNameFolded.includes(yearFromQuery) ||
+      slugFolded.includes(yearFromQuery))
+  );
+  let total = tokenSum;
+  if (yearFromQuery && yearMatch) total += MATCH_YEAR_BONUS;
+  total += rating * MATCH_RATING_WEIGHT;
+  total += Math.log1p(Math.max(0, reviewCount)) * MATCH_REVIEW_LOG_WEIGHT;
+
+  return { total, tokenSum, yearMatch };
+}
+
+/** Pick Vivino row with highest composite match score for the shop search string. */
 function pickBestFromMatches(
   matches: Array<Record<string, unknown>>,
   _searchTerm: string
 ): VivinoSearchResult | null {
-  const searchWords = _searchTerm.toLowerCase().split(/\s+/).filter((w) => w.length > 1);
-  let bestRated: VivinoSearchResult | null = null;
-  let bestRatedScore = -1;
-  let bestByName: VivinoSearchResult | null = null;
-  let bestByNameScore = -1;
+  const { anchors, year: yearFromQuery } = anchorTokensForWineQuery(_searchTerm);
+  const scoringTokens = [...new Set(anchors)];
+
+  type Scored = {
+    result: VivinoSearchResult;
+    score: number;
+    tokenSum: number;
+    yearMatch: boolean;
+  };
+  const scored: Scored[] = [];
+
   for (const match of matches) {
     const vintage = match?.vintage as Record<string, unknown> | undefined;
     if (!vintage) continue;
@@ -282,149 +619,48 @@ function pickBestFromMatches(
     const count = (stats.ratings_count ?? 0) as number;
     const wine = (vintage.wine ?? {}) as Record<string, unknown>;
     const slug = (vintage.seo_name ?? wine.seo_name ?? '') as string;
+    const slugFolded = foldWineCompare(String(slug));
     const id = (wine.id ?? vintage.id ?? '') as string;
     const vivinoUrl =
       slug && id
         ? `https://www.vivino.com/${slug}/w/${id}`
         : `https://www.vivino.com/en/search/wines?q=${encodeURIComponent(_searchTerm)}`;
-    const name = (vintage.name ?? wine.name ?? '') as string;
-    const nameLower = name.toLowerCase();
-    const matchCount = searchWords.filter((w) => nameLower.includes(w)).length;
-    const score = searchWords.length > 0 ? matchCount / searchWords.length : 1;
-    const result = { rating, reviewCount: count, vivinoUrl, vivinoWineName: name || undefined };
-    if (rating > 0 && score > bestRatedScore) {
-      bestRatedScore = score;
-      bestRated = result;
-      if (score >= 0.5) return bestRated;
-    }
-    if (score > bestByNameScore) {
-      bestByNameScore = score;
-      bestByName = result;
-    }
-  }
-  if (bestRated) return bestRated;
-  if (bestByName && bestByNameScore >= 0.5) return bestByName;
-  return null;
-}
+    const vintageName = (vintage.name ?? wine.name ?? '') as string;
+    const wineOnlyName = (wine.name ?? '') as string;
+    const vintageNameFolded = foldWineCompare(vintageName);
+    const wineNameFolded = foldWineCompare(String(wineOnlyName));
 
-/**
- * Parse Vivino search page HTML for first wine result.
- * Tries: data-preloaded-state, application/json scripts, __PRELOADED_STATE__, __NEXT_DATA__, regex.
- */
-function parseVivinoSearchHtml(html: string, _searchTerm: string): VivinoSearchResult | null {
-  // 0a. data-preloaded-state (escaped JSON; avoid fragile [^"]+ if a raw quote slips in)
-  const rawPreloaded = extractDataPreloadedStateRaw(html);
-  if (rawPreloaded) {
-    try {
-      const jsonStr = unescapeHtml(rawPreloaded);
-      const data = JSON.parse(jsonStr) as Record<string, unknown>;
-      const searchResults = (data?.search_results ?? data?.searchResults) as
-        | Record<string, unknown>
-        | undefined;
-      const matches = searchResults?.matches as Array<Record<string, unknown>> | undefined;
-      if (Array.isArray(matches) && matches.length > 0) {
-        const picked = pickBestFromMatches(matches, _searchTerm);
-        if (picked) return picked;
-      }
-    } catch {
-      /* fall through */
-    }
+    const { total, tokenSum, yearMatch } = vivinoRecordMatchScoreFields(
+      scoringTokens,
+      yearFromQuery,
+      vintageNameFolded,
+      wineNameFolded,
+      slugFolded,
+      rating,
+      count
+    );
+
+    if (anchors.length > 0 && tokenSum === 0) continue;
+
+    const result = {
+      rating,
+      reviewCount: count,
+      vivinoUrl,
+      vivinoWineName: vintageName || undefined,
+    };
+    scored.push({ result, score: total, tokenSum, yearMatch });
   }
 
-  // 0b. Large application/json blocks (e.g. locale-specific / explore pages without data-preloaded-state)
-  const jsonScriptRe = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let scriptMatch: RegExpExecArray | null;
-  while ((scriptMatch = jsonScriptRe.exec(html)) !== null) {
-    const body = scriptMatch[1].trim();
-    if (body.length < 500 || !body.includes('"matches"')) continue;
-    try {
-      const data = JSON.parse(body) as unknown;
-      const matches = findSearchMatchesArray(data);
-      if (matches && matches.length > 0) {
-        const picked = pickBestFromMatches(matches, _searchTerm);
-        if (picked) return picked;
-      }
-    } catch {
-      /* next script */
-    }
-  }
+  if (scored.length === 0) return null;
 
-  const extractFromRecords = (records: unknown[]): VivinoSearchResult | null => {
-    const first = records[0] as Record<string, unknown> | undefined;
-    if (!first?.vintage) return null;
-    const v = first.vintage as Record<string, unknown>;
-    const wine = v.wine as Record<string, unknown> | undefined;
-    if (!wine) return null;
-    const stats = (v.statistics ?? (v.aggregate as Record<string, unknown>)?.statistics ?? {}) as Record<string, unknown>;
-    const rating = (stats.ratings_average ?? stats.rating ?? 0) as number;
-    const count = (stats.ratings_count ?? stats.num_reviews ?? 0) as number;
-    const slug = (wine.slug ?? wine.seo_name ?? '') as string;
-    const id = (wine.id ?? v.id ?? '') as string;
-    const vivinoUrl = slug
-      ? `https://www.vivino.com/${slug}/w/${id}`
-      : `https://www.vivino.com/en/search/wines?q=${encodeURIComponent(_searchTerm)}`;
-    const vivinoWineName = (v.name ?? wine.name ?? '') as string;
-    return rating > 0 ? { rating, reviewCount: count, vivinoUrl, vivinoWineName: vivinoWineName || undefined } : null;
-  };
+  scored.sort((a, b) => {
+    if (Math.abs(a.score - b.score) > 1e-6) return b.score - a.score;
+    if (a.yearMatch !== b.yearMatch) return (b.yearMatch ? 1 : 0) - (a.yearMatch ? 1 : 0);
+    if (a.tokenSum !== b.tokenSum) return b.tokenSum - a.tokenSum;
+    return b.result.rating - a.result.rating;
+  });
 
-  // 1. Try __PRELOADED_STATE__
-  const preloadedMatch = html.match(
-    /window\.__PRELOADED_STATE__\s*=\s*(\{[\s\S]*?\});?\s*(?:<\/script>|$)/m
-  );
-  if (preloadedMatch) {
-    try {
-      const data = JSON.parse(preloadedMatch[1]);
-      const records =
-        data?.explore_vintage?.records ??
-        data?.records ??
-        data?.explore?.records ??
-        [];
-      const arr = Array.isArray(records) ? records : [];
-      if (arr.length > 0) {
-        const r = extractFromRecords(arr);
-        if (r) return r;
-      }
-    } catch {
-      /* fall through */
-    }
-  }
-
-  // 2. Try __NEXT_DATA__
-  const nextDataMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
-  if (nextDataMatch) {
-    try {
-      const data = JSON.parse(nextDataMatch[1]);
-      const props = data?.props?.pageProps ?? data?.props ?? {};
-      const records =
-        props?.explore_vintage?.records ?? props?.records ?? props?.explore?.records ?? [];
-      const arr = Array.isArray(records) ? records : [];
-      if (arr.length > 0) {
-        const r = extractFromRecords(arr);
-        if (r) return r;
-      }
-    } catch {
-      /* fall through */
-    }
-  }
-
-  // 3. Regex fallback: look for rating pattern and first wine link
-  const ratingMatch = html.match(
-    /(?:rating|ratings_average|"average"[:\s]*)(?:["'])?(\d\.\d)(?:["'])?/i
-  );
-  const linkMatch = html.match(/href="(\/[\w-]+\/w\/\d+[^"]*)"/);
-  const rating = ratingMatch ? parseFloat(ratingMatch[1]) : 0;
-  const vivinoUrl = linkMatch
-    ? `https://www.vivino.com${linkMatch[1].replace(/&amp;/g, '&')}`
-    : `https://www.vivino.com/en/search/wines?q=${encodeURIComponent(_searchTerm)}`;
-
-  const reviewMatch = html.match(/(?:ratings_count|num_reviews|"count"[:\s]*)(?:["'])?(\d+)/i);
-  const reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : 0;
-
-  if (rating > 0 && rating <= 5) {
-    return { rating, reviewCount, vivinoUrl };
-  }
-
-  return null;
+  return scored[0].result;
 }
 
 /** Internal validation test: Chateau Mont Perat 2022 should return 3.7 */
@@ -485,6 +721,30 @@ async function runValidationTest(): Promise<{
 /** Get default config with presets */
 function getDefaultConfig(): ExtensionConfig {
   return { whitelist: [...DEFAULT_DOMAIN_PRESETS] };
+}
+
+/** Persist detected selectors into sync whitelist so the user does not need manual Save. */
+async function mergeDetectionIntoWhitelist(m: DetectionResultMessage): Promise<void> {
+  try {
+    const { whitelist } = await chrome.storage.sync.get('whitelist');
+    const list: DomainConfig[] = Array.isArray(whitelist) ? [...(whitelist as DomainConfig[])] : [];
+    const norm = (d: string) => d.replace(/^www\./, '').toLowerCase();
+    const entry: DomainConfig = {
+      domain: norm(m.domain),
+      containerSelector: m.containerSelector,
+      nameSelector: m.nameSelector,
+      ...(m.winerySelector ? { winerySelector: m.winerySelector } : {}),
+    };
+    const idx = list.findIndex((d) => norm(d.domain) === entry.domain);
+    if (idx >= 0) list[idx] = entry;
+    else list.push(entry);
+    await chrome.storage.sync.set({ whitelist: list });
+    await logBackground('info', 'Whitelist saved from detection', { domain: entry.domain });
+  } catch (err) {
+    await logBackground('error', 'mergeDetectionIntoWhitelist failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 function scheduleGithubReleaseAlarm(): void {
@@ -610,6 +870,7 @@ chrome.runtime.onMessage.addListener(
       return false;
     }
     if (message.type === 'DETECTION_RESULT') {
+      void mergeDetectionIntoWhitelist(message as DetectionResultMessage);
       chrome.storage.local.set({ pendingDetection: message });
       sendResponse({ ok: true });
       return false;

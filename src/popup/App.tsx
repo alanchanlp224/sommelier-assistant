@@ -116,6 +116,10 @@ function App() {
           setDelayMax(changes[DELAY_MAX_KEY].newValue as number);
         }
       }
+      if (area === 'sync' && changes.whitelist) {
+        const list = changes.whitelist.newValue as DomainConfig[] | undefined;
+        setWhitelist(Array.isArray(list) && list.length > 0 ? list : DEFAULT_PRESETS);
+      }
     };
     chrome.storage.onChanged.addListener(onStorageChange);
     return () => chrome.storage.onChanged.removeListener(onStorageChange);

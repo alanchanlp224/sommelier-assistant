@@ -22,4 +22,11 @@ export const DEFAULT_DOMAIN_PRESETS: DomainConfig[] = [
       'div.items:has(a[href*="/p/"]), div[class*="product"]:has(a[href*="/p/"]), div.items',
     nameSelector: 'a[href*="/p/"], a[href*="/product/"], h2, h3, a',
   },
+  {
+    domain: 'remfly.com.hk',
+    /** Keep in sync with REMFLY_BUILTIN in remflyEffectiveConfig.ts (content script cannot import this file). */
+    containerSelector: 'div.product-cardcontainer',
+    nameSelector:
+      'p.montserrat.rem-text-16.text-remdark.list-none, p.montserrat.rem-text-16.text-remdark.grid-none, p.montserrat.rem-text-16.text-remdark',
+  },
 ];

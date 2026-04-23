@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sommelier Assistant",
-  "version": "1.0.7",
+  "version": "1.0.20",
   "description": "Adds Vivino ratings to wine products on e-commerce websites",
   "permissions": [
     "storage",
@@ -9,8 +9,18 @@
     "tabs",
     "scripting",
     "alarms",
-    "downloads"
+    "downloads",
+    "declarativeNetRequest"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "vivino_fetch_headers",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
   "host_permissions": [
     "https://www.vivino.com/*",
     "https://api.github.com/*",

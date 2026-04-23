@@ -4,6 +4,9 @@
  */
 
 import type { DomainConfig, SearchResultMessage, SearchErrorMessage } from '../types';
+import { isLiquorLawDisclaimerText } from '../shared/liquorDisclaimer';
+import { effectiveRemflyConfig, remflyStoredSelectorsLookBroken } from '../shared/remflyEffectiveConfig';
+import { remflyNormalizeSearchTitle } from '../shared/remflySearchTitle';
 import { startDetection } from './detection';
 
 function logContent(level: 'info' | 'warn' | 'error' | 'debug', message: string, data?: unknown): void {
@@ -17,7 +20,21 @@ async function getMatchingConfig(): Promise<DomainConfig | null> {
     whitelist?: DomainConfig[];
   };
   const list = whitelist ?? [];
-  return list.find((d) => hostname === d.domain.replace(/^www\./, '')) ?? null;
+  const found = list.find((d) => hostname === d.domain.replace(/^www\./, '')) ?? null;
+  if (!found) return null;
+  if (hostname === 'remfly.com.hk') {
+    if (remflyStoredSelectorsLookBroken(found)) {
+      logContent('warn', 'Remfly: using built-in product card selectors (saved selectors were invalid)', {
+        saved: {
+          containerSelector: found.containerSelector,
+          nameSelector: found.nameSelector,
+          winerySelector: found.winerySelector ?? '(none)',
+        },
+      });
+    }
+    return effectiveRemflyConfig(found);
+  }
+  return found;
 }
 
 /** Names to skip when scanning - common WooCommerce/shop UI text mistaken for wine names */
@@ -107,6 +124,7 @@ function isLikelyWineName(name: string): boolean {
 /** Reject nav/footer links and titles that are too short or generic to be a wine listing. */
 function isLikelyWineDisplayName(name: string, el: HTMLElement | null): boolean {
   if (!isLikelyWineName(name)) return false;
+  if (isLiquorLawDisclaimerText(name)) return false;
   const normalized = name.toLowerCase().trim().replace(/\s+/g, ' ');
   if (NAV_FOOTER_PHRASES.has(normalized)) return false;
   if (el?.tagName === 'A') {
@@ -127,6 +145,34 @@ function isLikelyWineDisplayName(name: string, el: HTMLElement | null): boolean 
   return wordCount >= 3 || hasVintageYear;
 }
 
+/** Nested themes (e.g. Remfly) may match outer + inner `.product-cardcontainer` — keep leaf cards only. */
+function filterInnermostContainers(nodes: NodeListOf<Element> | Element[]): HTMLElement[] {
+  const arr = [...nodes] as HTMLElement[];
+  return arr.filter((el) => !arr.some((other) => other !== el && other.contains(el)));
+}
+
+/** One listing tile for badge targeting / dedupe (Remfly card, WooCommerce `li.product`, etc.). */
+function productCardRoot(el: HTMLElement): HTMLElement {
+  return (
+    (el.closest(
+      'div.product-cardcontainer, li.product, article.product, li[class*="product"]'
+    ) as HTMLElement) || el
+  );
+}
+
+/** Same physical card was scanned twice when containers nested — one wine per card. */
+function dedupeWinesByProductCard(wines: { name: string; element: HTMLElement }[]): {
+  name: string;
+  element: HTMLElement;
+}[] {
+  const byCard = new Map<HTMLElement, { name: string; element: HTMLElement }>();
+  for (const w of wines) {
+    const root = productCardRoot(w.element);
+    if (!byCard.has(root)) byCard.set(root, w);
+  }
+  return [...byCard.values()];
+}
+
 /** Prefer product detail links on listing pages (e.g. Watson’s Wine uses …/p/…). */
 function preferProductAnchors(candidates: Iterable<Element>): HTMLElement[] {
   const list = [...candidates] as HTMLElement[];
@@ -136,6 +182,18 @@ function preferProductAnchors(candidates: Iterable<Element>): HTMLElement[] {
     return href.includes('/p/') || href.includes('/product/');
   });
   return productLinks.length > 0 ? productLinks : list;
+}
+
+/**
+ * Remfly tiles show Chinese title lines before English (`Ch. …`). We used to take the first
+ * `p.montserrat…` which is often CJK-only — `remflyNormalizeSearchTitle` then strips to empty and
+ * the scan yields zero wines. Prefer lines with more Latin after normalization (English wine name).
+ */
+function reorderRemflyWineCandidates(container: HTMLElement, candidates: HTMLElement[]): HTMLElement[] {
+  if (!container.closest('div.product-cardcontainer')) return [...candidates];
+  const latinScore = (el: HTMLElement): number =>
+    remflyNormalizeSearchTitle(el.textContent?.trim() ?? '').replace(/[^a-z]/gi, '').length;
+  return [...candidates].sort((a, b) => latinScore(b) - latinScore(a));
 }
 
 /** WooCommerce fallback selectors when config returns no results */
@@ -155,7 +213,7 @@ function scanWines(config: DomainConfig): { name: string; element: HTMLElement }
     source?: string
   ): { name: string; element: HTMLElement }[] => {
     const results: { name: string; element: HTMLElement }[] = [];
-    const containers = document.querySelectorAll(containerSel);
+    const containers = filterInnermostContainers(document.querySelectorAll(containerSel));
     logContent('debug', `trySelectors: ${containers.length} containers`, {
       containerSel,
       nameSel,
@@ -163,7 +221,10 @@ function scanWines(config: DomainConfig): { name: string; element: HTMLElement }
       source,
     });
     containers.forEach((container) => {
-      const candidates = preferProductAnchors(container.querySelectorAll(nameSel));
+      const candidates = reorderRemflyWineCandidates(
+        container,
+        preferProductAnchors(container.querySelectorAll(nameSel))
+      );
       let nameEl: HTMLElement | null = null;
       let wineName: string | null = null;
       for (const el of candidates) {
@@ -203,9 +264,12 @@ function scanWines(config: DomainConfig): { name: string; element: HTMLElement }
     nameSel: string
   ): { name: string; element: HTMLElement }[] => {
     const results: { name: string; element: HTMLElement }[] = [];
-    const containers = document.querySelectorAll(containerSel);
+    const containers = filterInnermostContainers(document.querySelectorAll(containerSel));
     containers.forEach((container) => {
-      const candidates = preferProductAnchors(container.querySelectorAll(nameSel));
+      const candidates = reorderRemflyWineCandidates(
+        container,
+        preferProductAnchors(container.querySelectorAll(nameSel))
+      );
       for (const el of candidates) {
         const he = el as HTMLElement;
         const name = he.textContent?.trim();
@@ -451,8 +515,8 @@ function handleSearchResult(msg: SearchResultMessage): void {
     });
     return;
   }
-  const existing = el.parentElement?.querySelector('[data-sommelier-badge]');
-  if (existing) existing.remove();
+  const card = productCardRoot(el);
+  card.querySelectorAll('[data-sommelier-badge]').forEach((n) => n.remove());
   const badge = createBadge(msg.rating, msg.reviewCount, msg.vivinoUrl, msg.vivinoWineName);
   el.parentElement?.insertBefore(badge, el.nextSibling);
   logContent('info', `Badge injected for "${msg.wineName}"`, { rating: msg.rating });
@@ -480,14 +544,28 @@ async function runScan(): Promise<void> {
     winerySelector: config.winerySelector ?? '(none)',
   });
 
-  const wines = scanWines(config);
-  logContent('info', `Scan found ${wines.length} wines`, {
-    wineNames: wines.map((w) => w.name).slice(0, 10),
-    sampleWithWinery: wines.slice(0, 3).map((w) => ({
-      searchName: w.name,
-      hasWineryPrefix: w.name.split(' ').length > 2, // heuristic: "Domaine X Wine Y" has many parts
-    })),
-  });
+  let wines = scanWines(config);
+  wines = dedupeWinesByProductCard(wines);
+  const domainNorm = config.domain.replace(/^www\./, '');
+  if (domainNorm === 'remfly.com.hk') {
+    wines = wines
+      .map((w) => ({
+        ...w,
+        name: remflyNormalizeSearchTitle(w.name),
+      }))
+      .filter((w) => w.name.length > 0);
+    logContent('info', `Scan found ${wines.length} wines (Remfly: English-only Vivino search names)`, {
+      wineNames: wines.map((w) => w.name).slice(0, 10),
+    });
+  } else {
+    logContent('info', `Scan found ${wines.length} wines`, {
+      wineNames: wines.map((w) => w.name).slice(0, 10),
+      sampleWithWinery: wines.slice(0, 3).map((w) => ({
+        searchName: w.name,
+        hasWineryPrefix: w.name.split(' ').length > 2,
+      })),
+    });
+  }
 
   if (wines.length === 0) {
     alert('Sommelier Assistant: No wine products found. Try adjusting the selectors in settings.');

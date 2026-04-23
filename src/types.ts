@@ -87,7 +87,7 @@ export type ExtensionMessage =
   | GetLogsMessage
   | RunValidationTestMessage;
 
-/** Vivino search result parsed from HTML */
+/** Vivino search result from Explore API (or client URL when linking) */
 export interface VivinoSearchResult {
   rating: number;
   reviewCount: number;

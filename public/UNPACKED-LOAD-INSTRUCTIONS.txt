@@ -1,14 +1,23 @@
 Sommelier Assistant — Chrome "Load unpacked"
 
-Use THIS folder (the dist output) as the unpacked extension root. Chrome needs
-manifest.json, background.js, and content.js in the same folder you select.
+WHY "missing manifest.json" IF YOU UNZIPPED FROM GITHUB
+  GitHub gives you SOURCE CODE only. Chrome needs the built extension in the
+  "dist" folder. Build first (see INSTALL.txt in the repository root), then
+  load the "dist" folder — not the repository root.
 
-If you received the project SOURCE (no dist folder):
+Use THIS folder as the unpacked extension root
+  The folder must contain manifest.json, background.js, and content.js together.
+  That is the "dist" output after: npm install && npm run build
+
+If you received SOURCE only (cloned or GitHub ZIP, no usable dist yet):
   1. Install Node.js LTS from https://nodejs.org/
-  2. In a terminal: cd to the project folder, then run: npm install
-  3. Run: npm run build
-  4. In chrome://extensions choose "Load unpacked" and select the dist folder
-     (not the project root).
+  2. Open a terminal in the project folder (Windows: Command Prompt or PowerShell).
+  3. Run: npm install
+  4. Run: npm run build
+  5. In chrome://extensions enable Developer mode → Load unpacked → choose the
+     **dist** subfolder inside this project (not the project root).
 
-To create a shareable zip on any OS: npm run package
-(That zips this built folder; do not rely on macOS-only "zip" commands.)
+If you downloaded sommelier-assistant.zip from a GitHub Release:
+  Unzip it and Load unpacked that folder — it is already built.
+
+To create the release zip yourself (any OS): npm run package

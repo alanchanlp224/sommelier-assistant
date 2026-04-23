@@ -1,0 +1,32 @@
+# When you publish a GitHub Release, attach the built extension zip so users can
+# install without Node/npm (Load unpacked → unzip this file’s contents).
+name: Attach extension zip to release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Build extension (no version bump)
+        run: npm run build:release
+
+      - name: Upload sommelier-assistant.zip to this release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sommelier-assistant.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

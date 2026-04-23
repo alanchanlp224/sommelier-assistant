@@ -1,0 +1,36 @@
+Sommelier Assistant — Install from GitHub (Windows, macOS, Linux)
+
+Why Chrome says "missing manifest.json"
+  The ZIP from GitHub is SOURCE CODE. The extension manifest is generated into
+  the "dist" folder only AFTER you build the project. The repo root does not
+  contain a loadable manifest.json for Chrome.
+
+What to do
+  1. Install Node.js LTS: https://nodejs.org/ (this installs npm).
+  2. Unzip the repository. Open Command Prompt or PowerShell (Windows).
+  3. Go into the project folder, for example:
+       cd %USERPROFILE%\Downloads\sommelier-assistant-main
+     (Your folder name may differ, e.g. sommelier-assistant-main or sommelier-assistant.)
+  4. Run:
+       npm install
+       npm run build
+     Wait until it finishes without errors. This creates a "dist" folder.
+  5. Chrome: open chrome://extensions → turn ON "Developer mode"
+     → "Load unpacked" → select the **dist** folder (inside this project),
+     NOT the top-level project folder.
+
+Optional: packaged release zip (no build on your PC)
+  GitHub always lists "Source code (zip)" on a release — that is only the repo,
+  not the built extension. You want the extra asset **sommelier-assistant.zip**
+  (built `dist/` folder zipped). Download that asset if present.
+
+  Maintainers — two ways to add that zip:
+    A) Automated: merge the workflow `.github/workflows/release-assets.yml`, then
+       each time you **Publish** a release on GitHub, Actions builds and attaches
+       **sommelier-assistant.zip** to the same release.
+    B) Manual: on your machine run `npm install` then `npm run build:release`,
+       then edit the GitHub Release → **Attach binaries** → upload
+       **sommelier-assistant.zip** from the project folder.
+
+  Use **build:release** (not **npm run package**) when packaging for a fixed
+  version tag — **package** runs a dev build step that bumps the patch version.
